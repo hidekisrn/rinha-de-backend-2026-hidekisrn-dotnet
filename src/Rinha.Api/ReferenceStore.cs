@@ -60,14 +60,14 @@ public sealed class ReferenceStore(IConfiguration configuration, ILogger<Referen
 
         logger.LogInformation(
             "Dataset pronto: {Total:N0} vetores ({Fraud:N0} fraude / {Legit:N0} legítimo) em {Elapsed}. Blob int8 ~{Mb} MB (mmap, compartilhável).",
-            VectorCount, FraudCount, LegitCount, sw.Elapsed, (VectorCount * (Dim + 1) + HeaderSize) / (1024 * 1024));
+            VectorCount, FraudCount, LegitCount, sw.Elapsed, (VectorCount * (Knn.Stride + 1) + HeaderSize) / (1024 * 1024));
     }
 
     public unsafe int CountFraudInTop5(ReadOnlySpan<byte> query)
     {
-        var vectors = new ReadOnlySpan<byte>(_vecPtr, checked((int)(VectorCount * Dim)));
+        var vectors = new ReadOnlySpan<byte>(_vecPtr, checked((int)(VectorCount * Knn.Stride)));
         var labels = new ReadOnlySpan<byte>(_labelPtr, checked((int)VectorCount));
-        return Knn.CountFraudInTop5(query, vectors, labels);
+        return Knn.CountFraudInTop5Simd(query, vectors, labels);
     }
 
     private async Task BuildBlobAsync(string gzPath, string blobPath, int expectedHint, CancellationToken ct)
@@ -78,8 +78,7 @@ public sealed class ReferenceStore(IConfiguration configuration, ILogger<Referen
         var tmpPath = blobPath + ".tmp";
         long count = 0;
         var labels = new List<byte>(expectedHint);
-        var qbuf = new byte[Dim];
-
+        var qbuf = new byte[Knn.Stride];
         await using (var outFs = new FileStream(tmpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
         {
             outFs.Write(new byte[HeaderSize]);
@@ -123,7 +122,7 @@ public sealed class ReferenceStore(IConfiguration configuration, ILogger<Referen
             int magic = BinaryPrimitives.ReadInt32LittleEndian(header[..4]);
             int version = BinaryPrimitives.ReadInt32LittleEndian(header[4..8]);
             long count = BinaryPrimitives.ReadInt64LittleEndian(header[8..16]);
-            long expectedLen = HeaderSize + count * (Dim + 1);
+            long expectedLen = HeaderSize + count * (Knn.Stride + 1);
 
             return magic == Magic && version == Quantizer.SchemeVersion && count > 0 && fs.Length == expectedLen;
         }
@@ -146,7 +145,7 @@ public sealed class ReferenceStore(IConfiguration configuration, ILogger<Referen
         long count = BinaryPrimitives.ReadInt64LittleEndian(new ReadOnlySpan<byte>(_basePtr + 8, 8));
         VectorCount = count;
         _vecPtr = _basePtr + HeaderSize;
-        _labelPtr = _vecPtr + count * Dim;
+        _labelPtr = _vecPtr + count * Knn.Stride;
 
         long fraud = 0;
         var labels = new ReadOnlySpan<byte>(_labelPtr, checked((int)count));

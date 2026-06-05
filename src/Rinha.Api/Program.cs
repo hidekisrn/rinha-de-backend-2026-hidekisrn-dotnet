@@ -21,7 +21,7 @@ app.MapPost("/fraud-score", (FraudScoreRequest req, ReferenceStore referenceStor
     {
         Span<float> quantizerFloat = stackalloc float[Vectorizer.Dim];
         Vectorizer.Vectorize(req, referenceStore.Normalization, referenceStore.RiskFor, quantizerFloat);
-        Span<byte> quantizerByte = stackalloc byte[Vectorizer.Dim];
+        Span<byte> quantizerByte = stackalloc byte[Knn.Stride];
         Quantizer.Quantize(quantizerFloat, quantizerByte);
 
         int fraud = referenceStore.CountFraudInTop5(quantizerByte);

@@ -2,7 +2,7 @@ namespace Rinha.Api;
 
 public static class Quantizer
 {
-    public const int SchemeVersion = 1;
+    public const int SchemeVersion = 2;
 
     public static byte Quantize(float x)
     {
