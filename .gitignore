@@ -1,0 +1,14 @@
+# Material de planejamento/aprendizado — local, não versionar
+/plano/
+
+# .NET (preparando para as próximas etapas)
+bin/
+obj/
+*.user
+artifacts/
+[Dd]ebug/
+[Rr]elease/
+
+# Datasets de referência (grandes; copiados da spec, não versionar)
+*.json.gz
+references.json
