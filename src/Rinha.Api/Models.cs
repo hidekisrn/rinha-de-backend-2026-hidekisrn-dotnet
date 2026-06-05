@@ -3,44 +3,45 @@ using System.Text.Json.Serialization;
 namespace Rinha.Api;
 
 public sealed record FraudScoreRequest(
-    string Id,
-    TransactionInfo Transaction,
-    CustomerInfo Customer,
-    MerchantInfo Merchant,
-    TerminalInfo Terminal,
-    LastTransactionInfo? LastTransaction);
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("transaction")] TransactionInfo Transaction,
+    [property: JsonPropertyName("customer")] CustomerInfo Customer,
+    [property: JsonPropertyName("merchant")] MerchantInfo Merchant,
+    [property: JsonPropertyName("terminal")] TerminalInfo Terminal,
+    [property: JsonPropertyName("last_transaction")] LastTransactionInfo? LastTransaction);
 
 public sealed record TransactionInfo(
-    double Amount,
-    int Installments,
-    DateTimeOffset RequestedAt);
+    [property: JsonPropertyName("amount")] double Amount,
+    [property: JsonPropertyName("installments")] int Installments,
+    [property: JsonPropertyName("requested_at")] DateTimeOffset RequestedAt);
 
 public sealed record CustomerInfo(
-    double AvgAmount,
+    [property: JsonPropertyName("avg_amount")] double AvgAmount,
     [property: JsonPropertyName("tx_count_24h")] int TxCount24h,
-    string[] KnownMerchants);
+    [property: JsonPropertyName("known_merchants")] string[] KnownMerchants);
 
 public sealed record MerchantInfo(
-    string Id,
-    string Mcc,
-    double AvgAmount);
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("mcc")] string Mcc,
+    [property: JsonPropertyName("avg_amount")] double AvgAmount);
 
 public sealed record TerminalInfo(
-    bool IsOnline,
-    bool CardPresent,
-    double KmFromHome);
+    [property: JsonPropertyName("is_online")] bool IsOnline,
+    [property: JsonPropertyName("card_present")] bool CardPresent,
+    [property: JsonPropertyName("km_from_home")] double KmFromHome);
 
 public sealed record LastTransactionInfo(
-    DateTimeOffset Timestamp,
-    double KmFromCurrent);
+    [property: JsonPropertyName("timestamp")] DateTimeOffset Timestamp,
+    [property: JsonPropertyName("km_from_current")] double KmFromCurrent);
 
 public sealed record FraudScoreResponse(
-    bool Approved,
-    double FraudScore);
+    [property: JsonPropertyName("approved")] bool Approved,
+    [property: JsonPropertyName("fraud_score")] double FraudScore);
+
 
 public sealed record ReferenceEntry(
-    float[] Vector,
-    string Label);
+    [property: JsonPropertyName("vector")] float[] Vector,
+    [property: JsonPropertyName("label")] string Label);
 
 public sealed record Normalization(
     [property: JsonPropertyName("max_amount")] double MaxAmount,
@@ -51,8 +52,6 @@ public sealed record Normalization(
     [property: JsonPropertyName("max_tx_count_24h")] double MaxTxCount24h,
     [property: JsonPropertyName("max_merchant_avg_amount")] double MaxMerchantAvgAmount);
 
-
-[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
 [JsonSerializable(typeof(FraudScoreRequest))]
 [JsonSerializable(typeof(FraudScoreResponse))]
 [JsonSerializable(typeof(Normalization))]
