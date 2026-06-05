@@ -1,4 +1,15 @@
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using Rinha.Api;
+
+if (args is ["build-blob", ..])
+{
+    var cfg = new ConfigurationBuilder().AddEnvironmentVariables().Build();
+    using var loggerFactory = LoggerFactory.Create(b => b.AddSimpleConsole());
+    using var bootstrap = new ReferenceStore(cfg, loggerFactory.CreateLogger<ReferenceStore>());
+    await bootstrap.LoadAsync();
+    return;
+}
 
 var builder = WebApplication.CreateBuilder(args);
 

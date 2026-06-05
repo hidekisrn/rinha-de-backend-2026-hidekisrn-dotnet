@@ -1,0 +1,12 @@
+# Contexto de build enxuto
+**/bin/
+**/obj/
+plano/
+tests/
+.git/
+.vs/
+*.user
+# o blob é regenerado dentro da imagem; não enviar o local (~49 MB)
+resources/references.q8.bin
+resources/references.q8.bin.tmp
+resources/example-payloads.json

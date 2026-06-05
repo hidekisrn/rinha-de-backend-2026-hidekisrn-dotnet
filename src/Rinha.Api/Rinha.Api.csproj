@@ -6,6 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <!-- Ponteiro sobre o memory-mapped file (acesso direto às páginas compartilhadas). -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Sem ICU: imagem menor e AOT-friendly. Datas ISO 8601 são culture-independent. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
 </Project>
