@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.IO.MemoryMappedFiles;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 
@@ -10,20 +11,25 @@ namespace Rinha.Api;
 public sealed class ReferenceStore(IConfiguration configuration, ILogger<ReferenceStore> logger) : IDisposable
 {
     private const int Dim = Vectorizer.Dim;
-    private const int HeaderSize = 16;
-    private const int Magic = 0x00385152; // "RQ8\0"
+    private const int Stride = Knn.Stride;
+    private const int HeaderSize = 32;
+    private const int Magic = 0x00385152;
     private const int DefaultExpectedVectors = 3_000_000;
     private const string BlobFileName = "references.q8.bin";
 
     private MemoryMappedFile? _mmf;
     private MemoryMappedViewAccessor? _accessor;
     private unsafe byte* _basePtr;
+    private unsafe byte* _centPtr;
+    private unsafe int* _offsetsPtr;
     private unsafe byte* _vecPtr;
     private unsafe byte* _labelPtr;
+    private int _nprobe;
 
     public Normalization Normalization { get; private set; } = null!;
     public IReadOnlyDictionary<string, double> MccRisk { get; private set; } = null!;
     public long VectorCount { get; private set; }
+    public int CellCount { get; private set; }
     public long FraudCount { get; private set; }
     public long LegitCount { get; private set; }
     public bool IsReady { get; private set; }
@@ -45,69 +51,88 @@ public sealed class ReferenceStore(IConfiguration configuration, ILogger<Referen
 
         var blobPath = Path.Combine(dir, BlobFileName);
         if (!IsBlobValid(blobPath))
-        {
-            int hint = configuration.GetValue("EXPECTED_VECTORS", DefaultExpectedVectors);
-            await BuildBlobAsync(Path.Combine(dir, "references.json.gz"), blobPath, hint, ct);
-        }
+            await BuildBlobAsync(Path.Combine(dir, "references.json.gz"), blobPath, ct);
         else
-        {
-            logger.LogInformation("Blob int8 válido encontrado em {Path}; reaproveitando.", blobPath);
-        }
+            logger.LogInformation("Blob IVF válido encontrado em {Path}; reaproveitando.", blobPath);
 
         OpenBlob(blobPath);
+
+        _nprobe = Math.Clamp(configuration.GetValue("NPROBE", 24), 1, CellCount);
         IsReady = true;
         sw.Stop();
-
         logger.LogInformation(
-            "Dataset pronto: {Total:N0} vetores ({Fraud:N0} fraude / {Legit:N0} legítimo) em {Elapsed}. Blob int8 ~{Mb} MB (mmap, compartilhável).",
-            VectorCount, FraudCount, LegitCount, sw.Elapsed, (VectorCount * (Knn.Stride + 1) + HeaderSize) / (1024 * 1024));
+            "Índice IVF pronto: {Total:N0} vetores, {Cells} células, nprobe={Nprobe} ({Fraud:N0} fraude / {Legit:N0} legítimo) em {Elapsed}.",
+            VectorCount, CellCount, _nprobe, FraudCount, LegitCount, sw.Elapsed);
     }
 
-    public unsafe int CountFraudInTop5(ReadOnlySpan<byte> query)
+    public int CountFraudInTop5(ReadOnlySpan<byte> query) => CountFraudInTop5(query, _nprobe);
+
+    public unsafe int CountFraudInTop5(ReadOnlySpan<byte> query, int nprobe)
     {
-        var vectors = new ReadOnlySpan<byte>(_vecPtr, checked((int)(VectorCount * Knn.Stride)));
+        int k = CellCount;
+        int n = checked((int)VectorCount);
+        var centroids = new ReadOnlySpan<byte>(_centPtr, k * Stride);
+        var offsets = new ReadOnlySpan<int>(_offsetsPtr, k + 1);
+        var vectors = new ReadOnlySpan<byte>(_vecPtr, n * Stride);
+        var labels = new ReadOnlySpan<byte>(_labelPtr, n);
+        return Knn.CountFraudIvf(query, centroids, offsets, vectors, labels, nprobe);
+    }
+
+    public unsafe int CountFraudBruteForce(ReadOnlySpan<byte> query)
+    {
+        var vectors = new ReadOnlySpan<byte>(_vecPtr, checked((int)(VectorCount * Stride)));
         var labels = new ReadOnlySpan<byte>(_labelPtr, checked((int)VectorCount));
         return Knn.CountFraudInTop5Simd(query, vectors, labels);
     }
 
-    private async Task BuildBlobAsync(string gzPath, string blobPath, int expectedHint, CancellationToken ct)
+    private async Task BuildBlobAsync(string gzPath, string blobPath, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
-        logger.LogInformation("Blob ausente/desatualizado: construindo {Path} a partir do .gz...", blobPath);
+        int hint = configuration.GetValue("EXPECTED_VECTORS", DefaultExpectedVectors);
+        int cells = configuration.GetValue("IVF_CELLS", 1024);
+        int maxIter = configuration.GetValue("IVF_MAXITER", 10);
+        logger.LogInformation("Construindo blob IVF (K={Cells}, maxIter={Iter}) a partir do .gz...", cells, maxIter);
 
-        var tmpPath = blobPath + ".tmp";
-        long count = 0;
-        var labels = new List<byte>(expectedHint);
-        var qbuf = new byte[Knn.Stride];
-        await using (var outFs = new FileStream(tmpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+        var vec = new List<byte>(hint * Stride);
+        var lab = new List<byte>(hint);
+        var qbuf = new byte[Stride];
+        await using (var gz = File.OpenRead(gzPath))
+        await using (var raw = new GZipStream(gz, CompressionMode.Decompress))
         {
-            outFs.Write(new byte[HeaderSize]);
-            await using var gz = File.OpenRead(gzPath);
-            await using var raw = new GZipStream(gz, CompressionMode.Decompress);
             await foreach (var entry in JsonSerializer.DeserializeAsyncEnumerable(raw, AppJsonContext.Default.ReferenceEntry, ct))
             {
                 if (entry is null || entry.Vector.Length != Dim)
                     throw new InvalidDataException($"Entrada de referência inválida (dimensão != {Dim}).");
-
                 Quantizer.Quantize(entry.Vector, qbuf);
-                outFs.Write(qbuf);
-                labels.Add(entry.Label == "fraud" ? (byte)1 : (byte)0);
-                count++;
+                vec.AddRange(qbuf);
+                lab.Add(entry.Label == "fraud" ? (byte)1 : (byte)0);
             }
+        }
+        long count = lab.Count;
+        logger.LogInformation("Vetores carregados ({Count:N0}); rodando k-means...", count);
 
-            outFs.Write(CollectionsMarshal.AsSpan(labels));
+        var ivf = IvfBuilder.Build(CollectionsMarshal.AsSpan(vec), CollectionsMarshal.AsSpan(lab),
+            cells, maxIter, seed: 1, log: m => logger.LogInformation("{Msg}", m));
 
+        var tmpPath = blobPath + ".tmp";
+        await using (var outFs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
             Span<byte> header = stackalloc byte[HeaderSize];
             BinaryPrimitives.WriteInt32LittleEndian(header[..4], Magic);
             BinaryPrimitives.WriteInt32LittleEndian(header[4..8], Quantizer.SchemeVersion);
             BinaryPrimitives.WriteInt64LittleEndian(header[8..16], count);
-            outFs.Position = 0;
+            BinaryPrimitives.WriteInt32LittleEndian(header[16..20], ivf.K);
+            BinaryPrimitives.WriteInt32LittleEndian(header[20..24], Stride);
             outFs.Write(header);
-        }
 
+            outFs.Write(ivf.CentroidsQ);
+            outFs.Write(MemoryMarshal.AsBytes<int>(ivf.CellOffsets));
+            outFs.Write(ivf.Vectors);
+            outFs.Write(ivf.Labels);
+        }
         File.Move(tmpPath, blobPath, overwrite: true);
         sw.Stop();
-        logger.LogInformation("Blob construído: {Count:N0} vetores em {Elapsed}.", count, sw.Elapsed);
+        logger.LogInformation("Blob IVF construído: {Count:N0} vetores, {Cells} células em {Elapsed}.", count, ivf.K, sw.Elapsed);
     }
 
     private bool IsBlobValid(string blobPath)
@@ -122,9 +147,12 @@ public sealed class ReferenceStore(IConfiguration configuration, ILogger<Referen
             int magic = BinaryPrimitives.ReadInt32LittleEndian(header[..4]);
             int version = BinaryPrimitives.ReadInt32LittleEndian(header[4..8]);
             long count = BinaryPrimitives.ReadInt64LittleEndian(header[8..16]);
-            long expectedLen = HeaderSize + count * (Knn.Stride + 1);
+            int k = BinaryPrimitives.ReadInt32LittleEndian(header[16..20]);
+            int stride = BinaryPrimitives.ReadInt32LittleEndian(header[20..24]);
 
-            return magic == Magic && version == Quantizer.SchemeVersion && count > 0 && fs.Length == expectedLen;
+            long expected = HeaderSize + (long)k * Stride + (long)(k + 1) * sizeof(int) + count * Stride + count;
+            return magic == Magic && version == Quantizer.SchemeVersion && count > 0 && k > 0
+                   && stride == Stride && fs.Length == expected;
         }
         catch
         {
@@ -143,14 +171,18 @@ public sealed class ReferenceStore(IConfiguration configuration, ILogger<Referen
         _basePtr = ptr;
 
         long count = BinaryPrimitives.ReadInt64LittleEndian(new ReadOnlySpan<byte>(_basePtr + 8, 8));
+        int k = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(_basePtr + 16, 4));
         VectorCount = count;
-        _vecPtr = _basePtr + HeaderSize;
-        _labelPtr = _vecPtr + count * Knn.Stride;
+        CellCount = k;
+
+        _centPtr = _basePtr + HeaderSize;
+        _offsetsPtr = (int*)(_centPtr + (long)k * Stride);
+        _vecPtr = (byte*)(_offsetsPtr + (k + 1));
+        _labelPtr = _vecPtr + count * Stride;
 
         long fraud = 0;
         var labels = new ReadOnlySpan<byte>(_labelPtr, checked((int)count));
-        for (int i = 0; i < labels.Length; i++)
-            if (labels[i] != 0) fraud++;
+        for (int i = 0; i < labels.Length; i++) if (labels[i] != 0) fraud++;
         FraudCount = fraud;
         LegitCount = count - fraud;
     }
@@ -158,21 +190,17 @@ public sealed class ReferenceStore(IConfiguration configuration, ILogger<Referen
     private string ResolveResourcesPath()
     {
         var configured = configuration["RESOURCES_PATH"];
-        if (!string.IsNullOrWhiteSpace(configured))
-            return configured;
+        if (!string.IsNullOrWhiteSpace(configured)) return configured;
 
         var dir = new DirectoryInfo(Directory.GetCurrentDirectory());
         while (dir is not null)
         {
             var candidate = Path.Combine(dir.FullName, "resources");
-            if (File.Exists(Path.Combine(candidate, "normalization.json")))
-                return candidate;
+            if (File.Exists(Path.Combine(candidate, "normalization.json"))) return candidate;
             dir = dir.Parent;
         }
-
         throw new DirectoryNotFoundException(
-            "Não encontrei a pasta 'resources' com normalization.json. " +
-            "Defina RESOURCES_PATH ou rode a partir do repositório.");
+            "Não encontrei a pasta 'resources' com normalization.json. Defina RESOURCES_PATH ou rode a partir do repositório.");
     }
 
     public unsafe void Dispose()

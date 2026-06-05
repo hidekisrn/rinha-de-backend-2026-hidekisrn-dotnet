@@ -1,6 +1,8 @@
 services:
   api1:
     image: rinha-fraud:latest
+    environment:
+      - NPROBE=16
     networks: [app]
     deploy:
       resources:
@@ -10,6 +12,8 @@ services:
 
   api2:
     image: rinha-fraud:latest
+    environment:
+      - NPROBE=16
     networks: [app]
     deploy:
       resources:
