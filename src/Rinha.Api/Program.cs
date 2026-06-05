@@ -19,10 +19,12 @@ app.MapPost("/fraud-score", (FraudScoreRequest req, ReferenceStore referenceStor
 {
     try
     {
-        Span<float> query = stackalloc float[Vectorizer.Dim];
-        Vectorizer.Vectorize(req, referenceStore.Normalization, referenceStore.RiskFor, query);
+        Span<float> quantizerFloat = stackalloc float[Vectorizer.Dim];
+        Vectorizer.Vectorize(req, referenceStore.Normalization, referenceStore.RiskFor, quantizerFloat);
+        Span<byte> quantizerByte = stackalloc byte[Vectorizer.Dim];
+        Quantizer.Quantize(quantizerFloat, quantizerByte);
 
-        int fraud = referenceStore.CountFraudInTop5(query);
+        int fraud = referenceStore.CountFraudInTop5(quantizerByte);
         double score = fraud / 5.0;
         return Results.Json(new FraudScoreResponse(score < 0.6, score),
             AppJsonContext.Default.FraudScoreResponse);

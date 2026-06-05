@@ -1,15 +1,25 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO.Compression;
+using System.IO.MemoryMappedFiles;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 
 namespace Rinha.Api;
 
-public sealed class ReferenceStore(IConfiguration configuration, ILogger<ReferenceStore> logger)
+public sealed class ReferenceStore(IConfiguration configuration, ILogger<ReferenceStore> logger) : IDisposable
 {
     private const int Dim = Vectorizer.Dim;
+    private const int HeaderSize = 16;
+    private const int Magic = 0x00385152; // "RQ8\0"
     private const int DefaultExpectedVectors = 3_000_000;
-    private float[] _vectors = [];
-    private bool[] _isFraud = [];
+    private const string BlobFileName = "references.q8.bin";
+
+    private MemoryMappedFile? _mmf;
+    private MemoryMappedViewAccessor? _accessor;
+    private unsafe byte* _basePtr;
+    private unsafe byte* _vecPtr;
+    private unsafe byte* _labelPtr;
 
     public Normalization Normalization { get; private set; } = null!;
     public IReadOnlyDictionary<string, double> MccRisk { get; private set; } = null!;
@@ -27,80 +37,123 @@ public sealed class ReferenceStore(IConfiguration configuration, ILogger<Referen
         logger.LogInformation("Carregando recursos de {Dir}", dir);
 
         await using (var fs = File.OpenRead(Path.Combine(dir, "normalization.json")))
-        {
             Normalization = (await JsonSerializer.DeserializeAsync(fs, AppJsonContext.Default.Normalization, ct))!;
-        }
 
         await using (var fs = File.OpenRead(Path.Combine(dir, "mcc_risk.json")))
-        {
             MccRisk = (await JsonSerializer.DeserializeAsync(fs, AppJsonContext.Default.DictionaryStringDouble, ct))!;
-        }
         logger.LogInformation("Normalização e {Count} MCCs carregados (default 0.5).", MccRisk.Count);
 
-        int expected = configuration.GetValue("EXPECTED_VECTORS", DefaultExpectedVectors);
-        var vectors = new List<float>(expected * Dim);
-        var isFraud = new List<bool>(expected);
-
-        await using var gz = File.OpenRead(Path.Combine(dir, "references.json.gz"));
-        await using var raw = new GZipStream(gz, CompressionMode.Decompress);
-        await foreach (var entry in JsonSerializer.DeserializeAsyncEnumerable(raw, AppJsonContext.Default.ReferenceEntry, ct))
+        var blobPath = Path.Combine(dir, BlobFileName);
+        if (!IsBlobValid(blobPath))
         {
-            if (entry is null || entry.Vector.Length != Dim)
-                throw new InvalidDataException($"Entrada de referência inválida (dimensão != {Dim}).");
-
-            vectors.AddRange(entry.Vector);
-            isFraud.Add(entry.Label == "fraud");
+            int hint = configuration.GetValue("EXPECTED_VECTORS", DefaultExpectedVectors);
+            await BuildBlobAsync(Path.Combine(dir, "references.json.gz"), blobPath, hint, ct);
+        }
+        else
+        {
+            logger.LogInformation("Blob int8 válido encontrado em {Path}; reaproveitando.", blobPath);
         }
 
-        _vectors = [.. vectors];
-        _isFraud = [.. isFraud];
-
-        VectorCount = isFraud.Count;
-        FraudCount = isFraud.Count(f => f);
-        LegitCount = VectorCount - FraudCount;
+        OpenBlob(blobPath);
         IsReady = true;
         sw.Stop();
 
         logger.LogInformation(
-            "Dataset carregado: {Total:N0} vetores ({Fraud:N0} fraude / {Legit:N0} legítimo) em {Elapsed}. RAM ~{Mb} MB no array de vetores.",
-            VectorCount, FraudCount, LegitCount, sw.Elapsed, (_vectors.Length * sizeof(float)) / (1024 * 1024));
+            "Dataset pronto: {Total:N0} vetores ({Fraud:N0} fraude / {Legit:N0} legítimo) em {Elapsed}. Blob int8 ~{Mb} MB (mmap, compartilhável).",
+            VectorCount, FraudCount, LegitCount, sw.Elapsed, (VectorCount * (Dim + 1) + HeaderSize) / (1024 * 1024));
     }
 
-    public int CountFraudInTop5(ReadOnlySpan<float> query)
+    public unsafe int CountFraudInTop5(ReadOnlySpan<byte> query)
     {
-        var vectors = _vectors;
-        var isFraud = _isFraud;
-        int n = isFraud.Length;
+        var vectors = new ReadOnlySpan<byte>(_vecPtr, checked((int)(VectorCount * Dim)));
+        var labels = new ReadOnlySpan<byte>(_labelPtr, checked((int)VectorCount));
+        return Knn.CountFraudInTop5(query, vectors, labels);
+    }
 
-        Span<float> bestDist = stackalloc float[5];
-        Span<bool> bestFraud = stackalloc bool[5];
-        bestDist.Fill(float.MaxValue);
-        int worst = 0;
+    private async Task BuildBlobAsync(string gzPath, string blobPath, int expectedHint, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        logger.LogInformation("Blob ausente/desatualizado: construindo {Path} a partir do .gz...", blobPath);
 
-        for (int i = 0; i < n; i++)
+        var tmpPath = blobPath + ".tmp";
+        long count = 0;
+        var labels = new List<byte>(expectedHint);
+        var qbuf = new byte[Dim];
+
+        await using (var outFs = new FileStream(tmpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
         {
-            int off = i * Dim;
-            float s = 0f;
-            for (int j = 0; j < Dim; j++)
+            outFs.Write(new byte[HeaderSize]);
+            await using var gz = File.OpenRead(gzPath);
+            await using var raw = new GZipStream(gz, CompressionMode.Decompress);
+            await foreach (var entry in JsonSerializer.DeserializeAsyncEnumerable(raw, AppJsonContext.Default.ReferenceEntry, ct))
             {
-                float diff = query[j] - vectors[off + j];
-                s += diff * diff;
+                if (entry is null || entry.Vector.Length != Dim)
+                    throw new InvalidDataException($"Entrada de referência inválida (dimensão != {Dim}).");
+
+                Quantizer.Quantize(entry.Vector, qbuf);
+                outFs.Write(qbuf);
+                labels.Add(entry.Label == "fraud" ? (byte)1 : (byte)0);
+                count++;
             }
 
-            if (s < bestDist[worst])
-            {
-                bestDist[worst] = s;
-                bestFraud[worst] = isFraud[i];
-                worst = 0;
-                for (int k = 1; k < 5; k++)
-                    if (bestDist[k] > bestDist[worst]) worst = k;
-            }
+            outFs.Write(CollectionsMarshal.AsSpan(labels));
+
+            Span<byte> header = stackalloc byte[HeaderSize];
+            BinaryPrimitives.WriteInt32LittleEndian(header[..4], Magic);
+            BinaryPrimitives.WriteInt32LittleEndian(header[4..8], Quantizer.SchemeVersion);
+            BinaryPrimitives.WriteInt64LittleEndian(header[8..16], count);
+            outFs.Position = 0;
+            outFs.Write(header);
         }
 
-        int fraud = 0;
-        for (int k = 0; k < 5; k++)
-            if (bestFraud[k]) fraud++;
-        return fraud;
+        File.Move(tmpPath, blobPath, overwrite: true);
+        sw.Stop();
+        logger.LogInformation("Blob construído: {Count:N0} vetores em {Elapsed}.", count, sw.Elapsed);
+    }
+
+    private bool IsBlobValid(string blobPath)
+    {
+        if (!File.Exists(blobPath)) return false;
+        try
+        {
+            using var fs = File.OpenRead(blobPath);
+            Span<byte> header = stackalloc byte[HeaderSize];
+            if (fs.Read(header) != HeaderSize) return false;
+
+            int magic = BinaryPrimitives.ReadInt32LittleEndian(header[..4]);
+            int version = BinaryPrimitives.ReadInt32LittleEndian(header[4..8]);
+            long count = BinaryPrimitives.ReadInt64LittleEndian(header[8..16]);
+            long expectedLen = HeaderSize + count * (Dim + 1);
+
+            return magic == Magic && version == Quantizer.SchemeVersion && count > 0 && fs.Length == expectedLen;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private unsafe void OpenBlob(string blobPath)
+    {
+        long len = new FileInfo(blobPath).Length;
+        _mmf = MemoryMappedFile.CreateFromFile(blobPath, FileMode.Open, mapName: null, 0, MemoryMappedFileAccess.Read);
+        _accessor = _mmf.CreateViewAccessor(0, len, MemoryMappedFileAccess.Read);
+
+        byte* ptr = null;
+        _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+        _basePtr = ptr;
+
+        long count = BinaryPrimitives.ReadInt64LittleEndian(new ReadOnlySpan<byte>(_basePtr + 8, 8));
+        VectorCount = count;
+        _vecPtr = _basePtr + HeaderSize;
+        _labelPtr = _vecPtr + count * Dim;
+
+        long fraud = 0;
+        var labels = new ReadOnlySpan<byte>(_labelPtr, checked((int)count));
+        for (int i = 0; i < labels.Length; i++)
+            if (labels[i] != 0) fraud++;
+        FraudCount = fraud;
+        LegitCount = count - fraud;
     }
 
     private string ResolveResourcesPath()
@@ -121,5 +174,16 @@ public sealed class ReferenceStore(IConfiguration configuration, ILogger<Referen
         throw new DirectoryNotFoundException(
             "Não encontrei a pasta 'resources' com normalization.json. " +
             "Defina RESOURCES_PATH ou rode a partir do repositório.");
+    }
+
+    public unsafe void Dispose()
+    {
+        if (_basePtr is not null && _accessor is not null)
+        {
+            _accessor.SafeMemoryMappedViewHandle.ReleasePointer();
+            _basePtr = null;
+        }
+        _accessor?.Dispose();
+        _mmf?.Dispose();
     }
 }

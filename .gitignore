@@ -12,3 +12,6 @@ artifacts/
 # Datasets de referência (grandes; copiados da spec, não versionar)
 *.json.gz
 references.json
+
+# Blob int8 derivado (gerado no startup/build a partir do .gz)
+*.bin
