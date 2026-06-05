@@ -1,0 +1,8 @@
+# Branch submission: contém SÓ os arquivos para a Engine da Rinha executar o teste.
+# Tudo o mais (código-fonte, plano/, resources/, etc.) está na branch `main`.
+*
+!.gitignore
+!docker-compose.yml
+!nginx.conf
+!info.json
+!README.md

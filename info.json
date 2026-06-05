@@ -1,0 +1,10 @@
+{
+    "participants": ["Sergio Ricardo Hideki Nisikava"],
+    "social": [
+        "https://github.com/hidekisrn",
+        "https://www.linkedin.com/in/sergiohideki/"
+    ],
+    "source-code-repo": "https://github.com/hidekisrn/rinha-de-backend-2026-hidekisrn-dotnet",
+    "stack": ["dotnet", "nginx"],
+    "open_to_work": false
+}
